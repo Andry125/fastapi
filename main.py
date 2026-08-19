@@ -12,14 +12,14 @@ QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
 # Initialiser Qdrant
 client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 
-# Lazy load du modèle (évite surcharge mémoire au boot)
+# Lazy load du modèle (chargé seulement à la première requête)
 model = None
 
 @app.get("/search")
 def search(q: str):
     global model
     if model is None:
-        # Modèle plus léger que distiluse (~90MB au lieu de ~500MB)
+        # Modèle compact (~90MB, adapté au plan gratuit Render)
         model = SentenceTransformer("all-MiniLM-L6-v2")
 
     query_vector = model.encode(q).tolist()
