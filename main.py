@@ -186,39 +186,35 @@ async def upload_pdf(
     }
 
 @app.post("/search/", response_model=List[SearchResult])
-async def search_documents(
-    search: SearchQuery,
-    x_api_key: Optional[str] = Header(None)
-):
-    if API_SECRET_KEY and x_api_key != API_SECRET_KEY:
-        raise HTTPException(403, "Clé API invalide")
-
-    # Embedding de la requête
-    query_vector = list(embedding_model.embed([search.query]))[0].tolist()
-
-    # Construction du filtre Qdrant
-    qdrant_filter = None
-    if search.filter:
-        qdrant_filter = qdrant_models.Filter(**search.filter)
-
-    # Recherche
-    results = qdrant.query_points(
-        collection_name=COLLECTION_NAME,
-        query_vector=query_vector,
-        limit=search.top_k,
-        query_filter=qdrant_filter,
-        with_payload=True,
-        with_vectors=False
-    )
-
-    return [
-        SearchResult(
-            id=hit.id,
-            score=hit.score,
-            payload=hit.payload
+async def search_documents(search: SearchQuery, x_api_key: Optional[str] = Header(None)):
+    try:
+        # Générer l'embedding
+        query_embedding = list(embedding_model.embed([search.query]))[0].tolist()
+        
+        # ✅ Nouvelle API (>= 1.10.0)
+        response = qdrant.query_points(
+            collection_name=COLLECTION_NAME,
+            query=query_vector,  # Notez 'query' au lieu de 'query_vector'
+            limit=search.top_k,  # Notez 'limit' (pas 'top')
+            with_payload=True,
+            with_vectors=False,
+            # filter=qdrant_filter  # si vous utilisez des filtres
         )
-        for hit in results
-    ]
+        results = response.points
+        
+        # Formater la réponse
+        return [
+            SearchResult(
+                id=hit.id,
+                score=hit.score,
+                payload=hit.payload
+            )
+            for hit in results
+        ]
+        
+    except Exception as e:
+        logger.error(f"Erreur : {e}")
+        raise HTTPException(500, f"Erreur interne : {str(e)}")
 
 @app.delete("/clear-collection/")
 async def clear_collection(
