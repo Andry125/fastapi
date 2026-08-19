@@ -1,4 +1,7 @@
 fastapi
 uvicorn
+python-multipart
 qdrant-client
-sentence-transformers
+fastembed
+pypdf
+pydantic
