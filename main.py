@@ -202,7 +202,7 @@ async def search_documents(
         qdrant_filter = qdrant_models.Filter(**search.filter)
 
     # Recherche
-    results = qdrant.search(
+    results = qdrant.query_points(
         collection_name=COLLECTION_NAME,
         query_vector=query_vector,
         limit=search.top_k,
