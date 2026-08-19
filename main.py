@@ -186,23 +186,54 @@ async def upload_pdf(
     }
 
 @app.post("/search/", response_model=List[SearchResult])
-async def search_documents(search: SearchQuery, x_api_key: Optional[str] = Header(None)):
+async def search_documents(
+    search: SearchQuery,
+    x_api_key: Optional[str] = Header(None)
+):
+    if API_SECRET_KEY and x_api_key != API_SECRET_KEY:
+        raise HTTPException(403, "Clé API invalide")
+
     try:
-        # Générer l'embedding
+        logger.info(f"🔍 Recherche : {search.query}")
+        
+        # Vérification du modèle
+        if embedding_model is None:
+            raise HTTPException(500, "Modèle d'embeddings non chargé")
+        
+        # Génération de l'embedding
         query_embedding = list(embedding_model.embed([search.query]))[0].tolist()
+        logger.info(f"✅ Embedding généré ({len(query_embedding)} dimensions)")
         
-        # ✅ Nouvelle API (>= 1.10.0)
-        response = qdrant.query_points(
-            collection_name=COLLECTION_NAME,
-            query=query_vector,  # Notez 'query' au lieu de 'query_vector'
-            limit=search.top_k,  # Notez 'limit' (pas 'top')
-            with_payload=True,
-            with_vectors=False,
-            # filter=qdrant_filter  # si vous utilisez des filtres
-        )
-        results = response.points
+        # Construction du filtre Qdrant (si fourni)
+        qdrant_filter = None
+        if search.filter:
+            qdrant_filter = qdrant_models.Filter(**search.filter)
         
-        # Formater la réponse
+        # ✅ Nouvelle API Qdrant (>= 1.10.0)
+        try:
+            # Essayer d'abord avec query_points (version moderne)
+            response = qdrant.query_points(
+                collection_name=COLLECTION_NAME,
+                query=query_embedding,  # ← Utiliser query_embedding
+                limit=search.top_k,
+                with_payload=True,
+                with_vectors=False,
+                query_filter=qdrant_filter
+            )
+            results = response.points
+        except AttributeError:
+            # Fallback : ancienne API
+            results = qdrant.search(
+                collection_name=COLLECTION_NAME,
+                query_vector=query_embedding,  # ← Utiliser query_embedding
+                limit=search.top_k,
+                with_payload=True,
+                with_vectors=False,
+                query_filter=qdrant_filter
+            )
+        
+        logger.info(f"✅ {len(results)} résultats trouvés")
+        
         return [
             SearchResult(
                 id=hit.id,
@@ -213,7 +244,9 @@ async def search_documents(search: SearchQuery, x_api_key: Optional[str] = Heade
         ]
         
     except Exception as e:
-        logger.error(f"Erreur : {e}")
+        logger.error(f"❌ Erreur : {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(500, f"Erreur interne : {str(e)}")
 
 @app.delete("/clear-collection/")
