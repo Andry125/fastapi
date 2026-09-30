@@ -79,16 +79,21 @@ def startup_event():
 def ensure_collection():
     collections = qdrant.get_collections().collections
     if COLLECTION_NAME not in [c.name for c in collections]:
-        logger.info(f"Création de la collection '{COLLECTION_NAME}'")
         qdrant.create_collection(
             collection_name=COLLECTION_NAME,
-            vectors_config=qdrant_models.VectorParams(
-                size=VECTOR_SIZE,
-                distance=qdrant_models.Distance.COSINE
-            )
+            vectors_config={
+                "dense": qdrant_models.VectorParams(
+                    size=VECTOR_SIZE,
+                    distance=qdrant_models.Distance.COSINE
+                )
+            },
+            # Configuration du vecteur sparse pour BM25
+            sparse_vectors_config={
+                "bm25": qdrant_models.SparseVectorParams(
+                    modifier=qdrant_models.Modifier.IDF
+                )
+            }
         )
-    else:
-        logger.info(f"Collection '{COLLECTION_NAME}' existe déjà.")
 
 # ----- Fonctions utilitaires -----
 def extract_text_from_pdf(pdf_file: UploadFile) -> str:
@@ -126,28 +131,24 @@ def generate_embeddings(chunks: List[str]):
     embeddings = [emb.tolist() for emb in embeddings_generator]
     return embeddings
 
-def upsert_chunks(filename: str, chunks: List[str], vectors: List[List[float]]):
-    """Insère les chunks et leurs vecteurs dans Qdrant."""
+def upsert_chunks(filename: str, chunks: List[str], dense_vectors: List[List[float]]):
     points = []
-    for i, (chunk, vector) in enumerate(zip(chunks, vectors)):
-        point_id = str(uuid.uuid4())
+    for i, (chunk, dense_vector) in enumerate(zip(chunks, dense_vectors)):
         points.append(
             qdrant_models.PointStruct(
-                id=point_id,
-                vector=vector,
-                payload={
-                    "filename": filename,
-                    "chunk_index": i,
-                    "text": chunk,
-                    "total_chunks": len(chunks)
-                }
+                id=str(uuid.uuid4()),
+                vector={
+                    "dense": dense_vector,
+                    # Qdrant génère automatiquement le vecteur BM25
+                    "bm25": qdrant_models.Document(
+                        text=chunk,
+                        model="qdrant/bm25"
+                    )
+                },
+                payload={...}
             )
         )
-    qdrant.upsert(
-        collection_name=COLLECTION_NAME,
-        points=points
-    )
-    return len(points)
+    qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
 
 # ----- Endpoints -----
 @app.get("/health")
@@ -186,67 +187,36 @@ async def upload_pdf(
     }
 
 @app.post("/search/", response_model=List[SearchResult])
-async def search_documents(
-    search: SearchQuery,
-    x_api_key: Optional[str] = Header(None)
-):
-    if API_SECRET_KEY and x_api_key != API_SECRET_KEY:
-        raise HTTPException(403, "Clé API invalide")
-
+async def search_documents(search: SearchQuery, x_api_key: Optional[str] = Header(None)):
     try:
-        logger.info(f"🔍 Recherche : {search.query}")
+        dense_query_vector = list(embedding_model.embed([search.query]))[0].tolist()
         
-        # Vérification du modèle
-        if embedding_model is None:
-            raise HTTPException(500, "Modèle d'embeddings non chargé")
+        # Recherche hybride avec fusion RRF
+        results = qdrant.query_points(
+            collection_name=COLLECTION_NAME,
+            prefetch=[
+                # Recherche sémantique (vecteur dense)
+                qdrant_models.Prefetch(
+                    query=dense_query_vector,
+                    using="dense",
+                    limit=search.top_k * 2
+                ),
+                # Recherche par mots-clés (BM25) - inférence côté serveur
+                qdrant_models.Prefetch(
+                    query=qdrant_models.Document(text=search.query, model="qdrant/bm25"),
+                    using="bm25",
+                    limit=search.top_k * 2
+                ),
+            ],
+            # Fusion des deux listes de résultats
+            query=qdrant_models.FusionQuery(fusion=qdrant_models.Fusion.RRF),
+            limit=search.top_k,
+            with_payload=True,
+            with_vectors=False,
+        ).points
         
-        # Génération de l'embedding
-        query_embedding = list(embedding_model.embed([search.query]))[0].tolist()
-        logger.info(f"✅ Embedding généré ({len(query_embedding)} dimensions)")
-        
-        # Construction du filtre Qdrant (si fourni)
-        qdrant_filter = None
-        if search.filter:
-            qdrant_filter = qdrant_models.Filter(**search.filter)
-        
-        # ✅ Nouvelle API Qdrant (>= 1.10.0)
-        try:
-            # Essayer d'abord avec query_points (version moderne)
-            response = qdrant.query_points(
-                collection_name=COLLECTION_NAME,
-                query=query_embedding,  # ← Utiliser query_embedding
-                limit=search.top_k,
-                with_payload=True,
-                with_vectors=False,
-                query_filter=qdrant_filter
-            )
-            results = response.points
-        except AttributeError:
-            # Fallback : ancienne API
-            results = qdrant.search(
-                collection_name=COLLECTION_NAME,
-                query_vector=query_embedding,  # ← Utiliser query_embedding
-                limit=search.top_k,
-                with_payload=True,
-                with_vectors=False,
-                query_filter=qdrant_filter
-            )
-        
-        logger.info(f"✅ {len(results)} résultats trouvés")
-        
-        return [
-            SearchResult(
-                id=hit.id,
-                score=hit.score,
-                payload=hit.payload
-            )
-            for hit in results
-        ]
-        
+        return [SearchResult(id=hit.id, score=hit.score, payload=hit.payload) for hit in results]
     except Exception as e:
-        logger.error(f"❌ Erreur : {e}")
-        import traceback
-        traceback.print_exc()
         raise HTTPException(500, f"Erreur interne : {str(e)}")
 
 @app.delete("/clear-collection/")
