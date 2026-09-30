@@ -9,41 +9,35 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import qdrant_client
 from qdrant_client.http import models as qdrant_models
-from fastembed import TextEmbedding  # ← remplace sentence-transformers
+from fastembed import TextEmbedding
 from pypdf import PdfReader
 
 # ----- Configuration -----
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Variables d'environnement (à définir sur Render)
 QDRANT_URL = os.getenv("QDRANT_URL")
 QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
-API_SECRET_KEY = os.getenv("API_SECRET_KEY")       # optionnel
+API_SECRET_KEY = os.getenv("API_SECRET_KEY")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "documents")
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "500"))   # en mots
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "500"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "50"))
 
-# Modèle FastEmbed (léger : ~100 Mo RAM, 384 dimensions)
-# Pour le français, vous pouvez utiliser "intfloat/multilingual-e5-small" (384 dims)
 MODEL_NAME = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
-VECTOR_SIZE = 384  # pour ce modèle (vérifier selon le modèle choisi)
+VECTOR_SIZE = 384
 
-# Connexion à Qdrant Cloud
 qdrant = qdrant_client.QdrantClient(
     url=QDRANT_URL,
     api_key=QDRANT_API_KEY,
     timeout=60
 )
 
-# ----- Initialisation de FastAPI -----
 app = FastAPI(
     title="PDF Ingestion & Semantic Search API",
-    description="API avec FastEmbed pour une faible consommation mémoire",
-    version="2.0.0"
+    description="API avec FastEmbed + recherche hybride (dense + BM25)",
+    version="3.0.0"
 )
 
-# CORS (à restreindre en production)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -63,22 +57,22 @@ class SearchResult(BaseModel):
     score: float
     payload: dict
 
-# ----- Chargement du modèle FastEmbed (global, une seule fois) -----
+# ----- Modèle global -----
 embedding_model = None
 
 @app.on_event("startup")
 def startup_event():
     global embedding_model
     logger.info(f"Chargement du modèle FastEmbed : {MODEL_NAME}")
-    # FastEmbed télécharge le modèle au premier appel si non présent
     embedding_model = TextEmbedding(model_name=MODEL_NAME)
     ensure_collection()
-    logger.info("Modèle chargé et collection prête.")
+    logger.info("✅ Modèle chargé et collection prête.")
 
 # ----- Vérification/création de la collection -----
 def ensure_collection():
     collections = qdrant.get_collections().collections
     if COLLECTION_NAME not in [c.name for c in collections]:
+        logger.info(f"Création de la collection '{COLLECTION_NAME}'...")
         qdrant.create_collection(
             collection_name=COLLECTION_NAME,
             vectors_config={
@@ -87,17 +81,18 @@ def ensure_collection():
                     distance=qdrant_models.Distance.COSINE
                 )
             },
-            # Configuration du vecteur sparse pour BM25
             sparse_vectors_config={
                 "bm25": qdrant_models.SparseVectorParams(
                     modifier=qdrant_models.Modifier.IDF
                 )
             }
         )
+        logger.info("✅ Collection créée.")
+    else:
+        logger.info(f"Collection '{COLLECTION_NAME}' existe déjà.")
 
 # ----- Fonctions utilitaires -----
 def extract_text_from_pdf(pdf_file: UploadFile) -> str:
-    """Extrait le texte d'un PDF."""
     try:
         content = pdf_file.file.read()
         reader = PdfReader(io.BytesIO(content))
@@ -109,12 +104,13 @@ def extract_text_from_pdf(pdf_file: UploadFile) -> str:
         if not text.strip():
             raise HTTPException(400, "Le PDF ne contient aucun texte extractible.")
         return text
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Erreur extraction PDF : {e}")
         raise HTTPException(500, f"Erreur de lecture du PDF : {str(e)}")
 
 def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
-    """Découpe le texte en chunks (par mots) avec chevauchement."""
     words = text.split()
     chunks = []
     for i in range(0, len(words), chunk_size - overlap):
@@ -123,15 +119,12 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVE
             chunks.append(chunk)
     return chunks
 
-def generate_embeddings(chunks: List[str]):
-    """Génère les embeddings avec FastEmbed. Retourne une liste de listes de floats."""
-    # FastEmbed.embed() retourne un générateur de numpy arrays
+def generate_embeddings(chunks: List[str]) -> List[List[float]]:
     embeddings_generator = embedding_model.embed(chunks)
-    # Convertir en listes de floats
-    embeddings = [emb.tolist() for emb in embeddings_generator]
-    return embeddings
+    return [emb.tolist() for emb in embeddings_generator]
 
-def upsert_chunks(filename: str, chunks: List[str], dense_vectors: List[List[float]]):
+def upsert_chunks(filename: str, chunks: List[str], dense_vectors: List[List[float]]) -> int:
+    """Insère les chunks avec vecteurs dense + BM25 et retourne le nombre inséré."""
     points = []
     for i, (chunk, dense_vector) in enumerate(zip(chunks, dense_vectors)):
         points.append(
@@ -139,21 +132,30 @@ def upsert_chunks(filename: str, chunks: List[str], dense_vectors: List[List[flo
                 id=str(uuid.uuid4()),
                 vector={
                     "dense": dense_vector,
-                    # Qdrant génère automatiquement le vecteur BM25
                     "bm25": qdrant_models.Document(
                         text=chunk,
                         model="qdrant/bm25"
                     )
                 },
-                payload={...}
+                payload={
+                    "filename": filename,
+                    "chunk_index": i,
+                    "text": chunk,
+                    "total_chunks": len(chunks)
+                }
             )
         )
     qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
+    return len(points)
 
 # ----- Endpoints -----
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "qdrant": "connected" if qdrant else "error"}
+    try:
+        qdrant.get_collections()
+        return {"status": "ok", "qdrant": "connected"}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
 
 @app.post("/upload-pdf/")
 async def upload_pdf(
@@ -166,17 +168,16 @@ async def upload_pdf(
     if file.content_type != "application/pdf":
         raise HTTPException(400, "Seuls les PDF sont acceptés")
 
-    # Extraction
+    logger.info(f"📄 Upload : {file.filename}")
     text = extract_text_from_pdf(file)
-    # Découpage
     chunks = chunk_text(text)
     if not chunks:
         raise HTTPException(400, "Aucun texte valide après découpage")
 
-    # Embeddings
+    logger.info(f"🔮 Génération des embeddings pour {len(chunks)} chunks...")
     vectors = generate_embeddings(chunks)
 
-    # Insertion dans Qdrant
+    logger.info("💾 Insertion dans Qdrant...")
     nb_inserted = upsert_chunks(file.filename, chunks, vectors)
 
     return {
@@ -187,42 +188,63 @@ async def upload_pdf(
     }
 
 @app.post("/search/", response_model=List[SearchResult])
-async def search_documents(search: SearchQuery, x_api_key: Optional[str] = Header(None)):
+async def search_documents(
+    search: SearchQuery,
+    x_api_key: Optional[str] = Header(None)
+):
+    if API_SECRET_KEY and x_api_key != API_SECRET_KEY:
+        raise HTTPException(403, "Clé API invalide")
+
     try:
+        logger.info(f"🔍 Recherche : {search.query}")
+
+        # Vecteur dense de la requête
         dense_query_vector = list(embedding_model.embed([search.query]))[0].tolist()
-        
-        # Recherche hybride avec fusion RRF
-        results = qdrant.query_points(
+
+        # Filtre optionnel
+        qdrant_filter = None
+        if search.filter:
+            qdrant_filter = qdrant_models.Filter(**search.filter)
+
+        # Recherche hybride
+        response = qdrant.query_points(
             collection_name=COLLECTION_NAME,
             prefetch=[
-                # Recherche sémantique (vecteur dense)
                 qdrant_models.Prefetch(
                     query=dense_query_vector,
                     using="dense",
-                    limit=search.top_k * 2
+                    limit=search.top_k * 2,
+                    filter=qdrant_filter
                 ),
-                # Recherche par mots-clés (BM25) - inférence côté serveur
                 qdrant_models.Prefetch(
                     query=qdrant_models.Document(text=search.query, model="qdrant/bm25"),
                     using="bm25",
-                    limit=search.top_k * 2
+                    limit=search.top_k * 2,
+                    filter=qdrant_filter
                 ),
             ],
-            # Fusion des deux listes de résultats
             query=qdrant_models.FusionQuery(fusion=qdrant_models.Fusion.RRF),
             limit=search.top_k,
             with_payload=True,
             with_vectors=False,
-        ).points
-        
-        return [SearchResult(id=hit.id, score=hit.score, payload=hit.payload) for hit in results]
+        )
+        results = response.points
+
+        logger.info(f"✅ {len(results)} résultats trouvés")
+
+        return [
+            SearchResult(id=hit.id, score=hit.score, payload=hit.payload)
+            for hit in results
+        ]
+
     except Exception as e:
+        logger.error(f"❌ Erreur : {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(500, f"Erreur interne : {str(e)}")
 
 @app.delete("/clear-collection/")
-async def clear_collection(
-    x_api_key: Optional[str] = Header(None)
-):
+async def clear_collection(x_api_key: Optional[str] = Header(None)):
     if API_SECRET_KEY and x_api_key != API_SECRET_KEY:
         raise HTTPException(403, "Clé API invalide")
     qdrant.delete_collection(collection_name=COLLECTION_NAME)
